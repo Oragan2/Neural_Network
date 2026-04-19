@@ -29,6 +29,22 @@ double relu_prime(double x) {
     return x > 0.0 ? 1.0 : 0.0;
 }
 
+inline std::vector<double> generate_random_vector(int count) {
+    std::vector<double> values(count);
+    for (int i = 0; i < count; ++i) {
+        values[i] = weight_bias_dist(neuron_rng);
+    }
+    return values;
+}
+
+#ifdef __CUDACC__
+inline void checkCuda(cudaError_t err, const char* message) {
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string(message) + ": " + cudaGetErrorString(err));
+    }
+}
+#endif
+
 // --- CPU-BASED CLASSES ---
 
 class Neuron {
@@ -211,7 +227,7 @@ public:
                 }
             }
 
-            if (epoch % 1000 == 0) {
+            if (epoch % 50 == 0) {
                 double total_loss = 0.0;
                 for (size_t i = 0; i < num_samples; ++i) {
                     std::vector<double> input_sample(inputs_data + i * input_size, inputs_data + (i + 1) * input_size);
@@ -229,6 +245,7 @@ public:
 };
 
 
+#ifdef __CUDACC__
 // --- GPU-BASED CLASSES ---
 
 class NeuralNetworkGPU {
@@ -236,63 +253,87 @@ private:
     std::vector<int> layout;
     std::vector<double*> d_weights, d_biases, d_weighted_sums, d_activations, d_deltas;
     double* d_input = nullptr;
+    double* d_labels = nullptr;
     int num_layers;
 
-    void allocate_layer(int layer_idx, int in_size, int out_size) {
-        double* w; cudaMalloc(&w, in_size * out_size * sizeof(double));
+    void allocate_layer(int in_size, int out_size) {
+        double* w;
+        checkCuda(cudaMalloc(&w, in_size * out_size * sizeof(double)), "cudaMalloc weights");
         d_weights.push_back(w);
 
-        double* b; cudaMalloc(&b, out_size * sizeof(double));
+        double* b;
+        checkCuda(cudaMalloc(&b, out_size * sizeof(double)), "cudaMalloc biases");
         d_biases.push_back(b);
 
-        double* s; cudaMalloc(&s, out_size * sizeof(double));
+        double* s;
+        checkCuda(cudaMalloc(&s, out_size * sizeof(double)), "cudaMalloc weighted_sums");
         d_weighted_sums.push_back(s);
 
-        double* a; cudaMalloc(&a, out_size * sizeof(double));
+        double* a;
+        checkCuda(cudaMalloc(&a, out_size * sizeof(double)), "cudaMalloc activations");
         d_activations.push_back(a);
 
-        double* d; cudaMalloc(&d, out_size * sizeof(double));
+        double* d;
+        checkCuda(cudaMalloc(&d, out_size * sizeof(double)), "cudaMalloc deltas");
         d_deltas.push_back(d);
+
+        auto host_weights = generate_random_vector(in_size * out_size);
+        auto host_biases = generate_random_vector(out_size);
+        checkCuda(cudaMemcpy(w, host_weights.data(), in_size * out_size * sizeof(double), cudaMemcpyHostToDevice), "copy weights to device");
+        checkCuda(cudaMemcpy(b, host_biases.data(), out_size * sizeof(double), cudaMemcpyHostToDevice), "copy biases to device");
     }
 
 public:
     NeuralNetworkGPU(const std::vector<int>& net_layout) : layout(net_layout) {
         num_layers = layout.size() - 1;
         for (int i = 0; i < num_layers; ++i) {
-            allocate_layer(i, layout[i], layout[i + 1]);
+            allocate_layer(layout[i], layout[i + 1]);
         }
+
+        checkCuda(cudaMalloc(&d_input, layout[0] * sizeof(double)), "cudaMalloc input buffer");
+        checkCuda(cudaMalloc(&d_labels, layout.back() * sizeof(double)), "cudaMalloc label buffer");
     }
 
     py::array_t<double> forward_pass(py::array_t<double> input_data_py) {
         auto buf = input_data_py.request();
         int input_size = buf.shape[0];
-        cudaMalloc(&d_input, input_size * sizeof(double));
-        cudaMemcpy(d_input, buf.ptr, input_size * sizeof(double), cudaMemcpyHostToDevice);
+        if (input_size != layout[0]) {
+            throw std::runtime_error("Input size does not match network layout.");
+        }
 
+        checkCuda(cudaMemcpy(d_input, buf.ptr, input_size * sizeof(double), cudaMemcpyHostToDevice), "copy input to device");
         double* prev_output = d_input;
 
         for (int i = 0; i < num_layers; ++i) {
             int in_size = layout[i];
             int out_size = layout[i + 1];
-            int threads = 256, blocks = (out_size + threads - 1) / threads;
+            int threads = 256;
+            int blocks = (out_size + threads - 1) / threads;
 
             forward_kernel<<<blocks, threads>>>(
                 prev_output, d_weights[i], d_biases[i],
-                d_activations[i], in_size, out_size
+                d_activations[i], d_weighted_sums[i], in_size, out_size
             );
+            checkCuda(cudaGetLastError(), "forward_kernel launch");
             prev_output = d_activations[i];
         }
 
         int final_size = layout.back();
         std::vector<double> result(final_size);
-        cudaMemcpy(result.data(), d_activations.back(), final_size * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaFree(d_input);
+        checkCuda(cudaMemcpy(result.data(), d_activations.back(), final_size * sizeof(double), cudaMemcpyDeviceToHost), "copy output to host");
         return py::cast(result);
     }
 
     void train(py::array_t<double> x_py, py::array_t<double> y_py, double lr, int epochs) {
-        auto x_buf = x_py.request(), y_buf = y_py.request();
-        int num_samples = x_buf.shape[0], input_size = x_buf.shape[1], output_size = y_buf.shape[1];
+        auto x_buf = x_py.request();
+        auto y_buf = y_py.request();
+        int num_samples = x_buf.shape[0];
+        int input_size = x_buf.shape[1];
+        int output_size = y_buf.shape[1];
+
+        if (input_size != layout[0] || output_size != layout.back()) {
+            throw std::runtime_error("Training data dimensions do not match network layout.");
+        }
 
         const double* x_ptr = static_cast<const double*>(x_buf.ptr);
         const double* y_ptr = static_cast<const double*>(y_buf.ptr);
@@ -302,45 +343,56 @@ public:
                 const double* input_sample = x_ptr + s * input_size;
                 const double* label_sample = y_ptr + s * output_size;
 
-                cudaMemcpy(d_input, input_sample, input_size * sizeof(double), cudaMemcpyHostToDevice);
+                checkCuda(cudaMemcpy(d_input, input_sample, input_size * sizeof(double), cudaMemcpyHostToDevice), "copy training input to device");
+                checkCuda(cudaMemcpy(d_labels, label_sample, output_size * sizeof(double), cudaMemcpyHostToDevice), "copy training label to device");
                 double* prev = d_input;
 
-                // Forward
+                // Forward pass
                 for (int i = 0; i < num_layers; ++i) {
-                    int in_size = layout[i], out_size = layout[i + 1];
-                    int threads = 256, blocks = (out_size + threads - 1) / threads;
-                    forward_kernel<<<blocks, threads>>>(prev, d_weights[i], d_biases[i], d_activations[i], in_size, out_size);
+                    int in_size = layout[i];
+                    int out_size = layout[i + 1];
+                    int threads = 256;
+                    int blocks = (out_size + threads - 1) / threads;
+                    forward_kernel<<<blocks, threads>>>(prev, d_weights[i], d_biases[i], d_activations[i], d_weighted_sums[i], in_size, out_size);
+                    checkCuda(cudaGetLastError(), "forward_kernel launch");
                     prev = d_activations[i];
                 }
 
                 // Output delta
                 int last = num_layers - 1;
-                int threads = 256, blocks = (layout.back() + threads - 1) / threads;
-                cudaMemcpy(d_activations.back(), prev, output_size * sizeof(double), cudaMemcpyDeviceToDevice);
+                int threads = 256;
+                int blocks = (output_size + threads - 1) / threads;
                 compute_output_delta<<<blocks, threads>>>(
-                    d_activations[last], label_sample, d_weighted_sums[last],
-                    d_deltas[last], layout.back()
+                    d_activations[last], d_labels, d_weighted_sums[last],
+                    d_deltas[last], output_size
                 );
+                checkCuda(cudaGetLastError(), "compute_output_delta launch");
 
                 // Hidden deltas
                 for (int i = num_layers - 2; i >= 0; --i) {
-                    int cur = layout[i + 1], next = layout[i + 2];
-                    int threads = 256, blocks = (cur + threads - 1) / threads;
+                    int cur = layout[i + 1];
+                    int next = layout[i + 2];
+                    int threads = 256;
+                    int blocks = (cur + threads - 1) / threads;
                     compute_hidden_delta<<<blocks, threads>>>(
                         d_deltas[i + 1], d_weights[i + 1], d_weighted_sums[i],
                         d_deltas[i], cur, next
                     );
+                    checkCuda(cudaGetLastError(), "compute_hidden_delta launch");
                 }
 
                 // Update weights
                 prev = d_input;
                 for (int i = 0; i < num_layers; ++i) {
-                    int in_size = layout[i], out_size = layout[i + 1];
-                    int threads = 256, blocks = (out_size + threads - 1) / threads;
+                    int in_size = layout[i];
+                    int out_size = layout[i + 1];
+                    int threads = 256;
+                    int blocks = (out_size + threads - 1) / threads;
                     update_weights_kernel<<<blocks, threads>>>(
                         d_weights[i], d_biases[i], d_deltas[i], prev,
                         in_size, out_size, lr
                     );
+                    checkCuda(cudaGetLastError(), "update_weights_kernel launch");
                     prev = d_activations[i];
                 }
             }
@@ -348,10 +400,11 @@ public:
                 std::cout << "Epoch " << epoch << " complete\n";
             }
         }
-        cudaFree(d_input);
     }
 
     ~NeuralNetworkGPU() {
+        if (d_input) cudaFree(d_input);
+        if (d_labels) cudaFree(d_labels);
         for (auto& p : d_weights) cudaFree(p);
         for (auto& p : d_biases) cudaFree(p);
         for (auto& p : d_activations) cudaFree(p);
@@ -359,17 +412,23 @@ public:
         for (auto& p : d_deltas) cudaFree(p);
     }
 };
+#endif // __CUDACC__
 
 // --- WRAPPER CLASS FOR CONDITIONAL EXECUTION ---
 
 class NeuralNetwork {
 private:
     std::unique_ptr<NeuralNetworkCPU> cpu_net;
+#ifdef __CUDACC__
     std::unique_ptr<NeuralNetworkGPU> gpu_net;
     bool using_gpu = false;
+#else
+    bool using_gpu = false;
+#endif
 
 public:
     NeuralNetwork(const std::vector<int>& layout) {
+#ifdef __CUDACC__
         int device_count = 0;
         cudaError_t err = cudaGetDeviceCount(&device_count);
 
@@ -378,26 +437,33 @@ public:
             using_gpu = true;
             gpu_net = std::make_unique<NeuralNetworkGPU>(layout);
         } else {
-            std::cout << "No CUDA-enabled GPU found. Using CPU threading." << std::endl;
+            std::cout << "No CUDA-enabled GPU found. Using CPU fallback." << std::endl;
             using_gpu = false;
             cpu_net = std::make_unique<NeuralNetworkCPU>(layout);
         }
+#else
+        std::cout << "CUDA support not available. Using CPU fallback." << std::endl;
+        cpu_net = std::make_unique<NeuralNetworkCPU>(layout);
+#endif
     }
     
     py::array_t<double> forward(py::array_t<double> input_data_py) {
+#ifdef __CUDACC__
         if (using_gpu) {
             return gpu_net->forward_pass(input_data_py);
-        } else {
-            return cpu_net->forward_pass(input_data_py);
         }
+#endif
+        return cpu_net->forward_pass(input_data_py);
     }
 
     void train(py::array_t<double> training_inputs_py, py::array_t<double> training_labels_py, double learning_rate, int epochs) {
+#ifdef __CUDACC__
         if (using_gpu) {
             gpu_net->train(training_inputs_py, training_labels_py, learning_rate, epochs);
-        } else {
-            cpu_net->train(training_inputs_py, training_labels_py, learning_rate, epochs);
+            return;
         }
+#endif
+        cpu_net->train(training_inputs_py, training_labels_py, learning_rate, epochs);
     }
 };
 

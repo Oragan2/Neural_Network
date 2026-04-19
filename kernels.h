@@ -1,11 +1,14 @@
 #ifndef KERNELS_H
 #define KERNELS_H
 
+#ifdef __CUDACC__
 #include <cuda_runtime.h>
+#endif
 
+#ifdef __CUDACC__
 extern "C" {
     __global__ void forward_kernel(const double* inputs, const double* weights, const double* biases,
-                                   double* outputs, int num_inputs, int num_outputs);
+                                   double* outputs, double* weighted_sums, int num_inputs, int num_outputs);
 
     __global__ void compute_output_delta(const double* outputs, const double* targets,
                                          const double* weighted_sums, double* deltas, int size);
@@ -18,5 +21,6 @@ extern "C" {
                                           const double* deltas, const double* inputs,
                                           int num_inputs, int num_outputs, double lr);
 }
+#endif
 
 #endif // KERNELS_H

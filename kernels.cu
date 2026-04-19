@@ -1,13 +1,14 @@
 #include "kernels.h"
 
 __global__ void forward_kernel(const double* inputs, const double* weights, const double* biases,
-                               double* outputs, int num_inputs, int num_outputs) {
+                               double* outputs, double* weighted_sums, int num_inputs, int num_outputs) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < num_outputs) {
         double sum = biases[i];
         for (int j = 0; j < num_inputs; ++j) {
             sum += inputs[j] * weights[i * num_inputs + j];
         }
+        weighted_sums[i] = sum;
         outputs[i] = sum > 0 ? sum : 0.0; // ReLU
     }
 }
